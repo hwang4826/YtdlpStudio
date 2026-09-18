@@ -1,0 +1,5 @@
+cd C:\Users\hwang\Documents\GitHub\2026_tuk_spoes\MFC_SetPT
+
+python -m PyInstaller --noconsole --onefile --collect-data tkinterdnd2 Easy_PeakParser.py
+python -m PyInstaller --noconsole --onefile --distpath . -n ytdlp_studio ytdlp_studio.py
+python -m PyInstaller --noconsole --onefile --icon="ytdlp_studio.ico" --add-data "ytdlp_studio.ico;." --distpath . -n ytdlp_studiov_1.0.0 ytdlp_studio.py
