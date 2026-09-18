@@ -310,16 +310,26 @@ class DownloaderTab(QWidget):
             
             common_opts = " ".join(opts)
             vid_ext = self.cb_vid_ext.currentText()
-            ext_opt = f'--merge-output-format {vid_ext}' if vid_ext != "추천" else ""
+            
+            # [수정됨] 음원만 단독 다운로드하는 상태인지 판별
+            only_audio = not self.chk_video.isChecked() and self.chk_audio.isChecked()
+            
+            # 음원만 받을 때는 영상 포맷 병합 옵션 무시
+            ext_opt = f'--merge-output-format {vid_ext}' if (vid_ext != "추천" and not only_audio) else ""
 
             download_fmt = "best"
-            url_lower = url.lower()
-            if "youtube.com" in url_lower or "youtu.be" in url_lower:
-                download_fmt = "bv*+ba/b"
-            elif "soop" in url_lower or "afreecatv" in url_lower or "chzzk" in url_lower:
-                best_hls = self.get_best_hls_format(yt_dlp, url, common_opts, prefix)
-                if best_hls:
-                    download_fmt = best_hls
+            
+            # [수정됨] '영상 다운로드' 해제 시 음원 전용 포맷(ba/bestaudio)으로만 다운로드
+            if only_audio:
+                download_fmt = "ba/bestaudio/b"
+            else:
+                url_lower = url.lower()
+                if "youtube.com" in url_lower or "youtu.be" in url_lower:
+                    download_fmt = "bv*+ba/b"
+                elif "soop" in url_lower or "afreecatv" in url_lower or "chzzk" in url_lower:
+                    best_hls = self.get_best_hls_format(yt_dlp, url, common_opts, prefix)
+                    if best_hls:
+                        download_fmt = best_hls
 
             vid_path = os.path.join(self.get_setting("영상 저장 폴더"), "%(title)s.%(ext)s")
             cmd = f'{yt_dlp} {common_opts} {ext_opt} -f "{download_fmt}" -o "{vid_path}" "{url}"'
@@ -341,10 +351,11 @@ class DownloaderTab(QWidget):
         latest_file = max(files, key=os.path.getctime)
         
         aud_ext = self.cb_aud_ext.currentText()
+        original_codec = self.get_audio_codec(latest_file)
+        
         if aud_ext == "추천":
-            codec = self.get_audio_codec(latest_file)
-            if codec == "opus": out_ext = "opus"
-            elif codec == "mp3": out_ext = "mp3"
+            if original_codec == "opus": out_ext = "opus"
+            elif original_codec == "mp3": out_ext = "mp3"
             else: out_ext = "m4a"
         else:
             out_ext = aud_ext
@@ -353,7 +364,17 @@ class DownloaderTab(QWidget):
         output_file = os.path.join(self.get_setting("음원 저장 폴더"), f"{name}.{out_ext}")
         
         ffmpeg = self.get_exe("ffmpeg.exe")
-        ffmpeg_cmd = f'{ffmpeg} -y -i "{latest_file}" -vn -b:a 192k "{output_file}"'
+        
+        # [수정됨] 원본 코덱과 출력 확장자가 같거나 '추천' 옵션일 경우, 재인코딩 없이 원본을 그대로 1초 만에 빼옴(copy)
+        is_compatible = (aud_ext == "추천") or \
+                        (out_ext == "opus" and original_codec == "opus") or \
+                        (out_ext == "mp3" and original_codec == "mp3") or \
+                        (out_ext == "m4a" and original_codec == "aac")
+                        
+        if is_compatible:
+            ffmpeg_cmd = f'{ffmpeg} -y -i "{latest_file}" -vn -c:a copy "{output_file}"'
+        else:
+            ffmpeg_cmd = f'{ffmpeg} -y -i "{latest_file}" -vn -b:a 192k "{output_file}"'
         
         self.signals.log_msg.emit(f"{prefix}🎵 음원 추출 진행 중...\n")
         self.run_cmd(ffmpeg_cmd, prefix)
@@ -1033,6 +1054,12 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("yt-dlp 미디어 통합 매니저")
         self.resize(900, 750)
+        
+        # [추가됨] 프로그램 실행 시 창을 화면 정중앙에 배치
+        screen_geo = QApplication.primaryScreen().availableGeometry()
+        x = (screen_geo.width() - self.width()) // 2
+        y = (screen_geo.height() - self.height()) // 2
+        self.move(x, y)
         
         Config.init_folders() 
 
