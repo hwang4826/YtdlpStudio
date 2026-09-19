@@ -33,6 +33,7 @@
 1. 설치 및 비디오 다운로더 사용 방법
 
   ① [Releases](https://github.com/사용자이름/리포지토리이름/releases) 페이지에서 최신 버전의 `ytdlp_studio.exe` 파일을 다운로드합니다.
+  
   <img width="247" height="259" alt="image" src="https://github.com/user-attachments/assets/1db26387-9afd-4643-ada3-f1ada990b8c0" />
 
   ② 다운로드한 `ytdlp_studio.exe`를 실행합니다.
