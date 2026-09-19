@@ -31,6 +31,7 @@
 ## 🚀 설치 및 사용 방법
 
 1. 설치 및 비디오 다운로더 사용 방법
+
   ① [Releases](https://github.com/사용자이름/리포지토리이름/releases) 페이지에서 최신 버전의 `ytdlp_studio.exe` 파일을 다운로드합니다.
   
   ② 다운로드한 `ytdlp_studio.exe`를 실행합니다.
@@ -43,6 +44,7 @@
   <img width="2560" height="1368" alt="image" src="https://github.com/user-attachments/assets/fb5fc1ae-1ac2-4d09-a706-7b2e1f8c71a3" />
   
 2. 미디어 편집기 사용 방법
+
   ① "찾아보기..." 버튼 혹은 드래그&드롭을 이용해 편집할 영상을 불러옵니다.
   <img width="2560" height="1368" alt="스크린샷 2026-09-19 181140" src="https://github.com/user-attachments/assets/679bd964-d0dc-45a6-abfc-30a6eabcc7ed" />
   
