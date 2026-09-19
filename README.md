@@ -28,6 +28,33 @@
 
 ---
 
+## 🚀 설치 및 사용 방법
+
+1. 설치 및 비디오 다운로더 사용 방법
+
+  ① [Releases](https://github.com/hwang4826/YtdlpStudio/releases/tag/v1.0.0) 페이지에서 최신 버전의 `ytdlp_studio.exe` 파일을 다운로드합니다.
+  
+  <img width="247" height="259" alt="image" src="https://github.com/user-attachments/assets/1db26387-9afd-4643-ada3-f1ada990b8c0" />
+
+  ② 다운로드한 `ytdlp_studio.exe`를 실행합니다.
+  <img width="2560" height="1368" alt="image" src="https://github.com/user-attachments/assets/1f36ef49-6d9e-4584-bd91-d5acb7674856" />
+  
+  ③ 다운로더 탭 우측 상단의 **[🛠 필수 도구 설치]** 버튼을 눌러 `yt-dlp 및 FFmpeg 자동 설치`를 진행합니다. (최초 1회만 필요)
+  <img width="248" height="188" alt="image" src="https://github.com/user-attachments/assets/31b41386-24bd-4b9e-89f0-29c4c82118d7" />
+  
+  ④ 원하는 주소를 입력해 다운로드하거나, 미디어 편집기 탭에 파일을 드래그하여 편집을 시작합니다!
+  <img width="2560" height="1368" alt="image" src="https://github.com/user-attachments/assets/fb5fc1ae-1ac2-4d09-a706-7b2e1f8c71a3" />
+  
+2. 미디어 편집기 사용 방법
+
+  ① "찾아보기..." 버튼 혹은 드래그&드롭을 이용해 편집할 영상을 불러옵니다.
+  <img width="2560" height="1368" alt="스크린샷 2026-09-19 181140" src="https://github.com/user-attachments/assets/679bd964-d0dc-45a6-abfc-30a6eabcc7ed" />
+  
+  ② 아래 단축키 안내를 참고하여 영상의 원하는 구간을 선택하고 잘라냅니다.
+  <img width="2560" height="1368" alt="스크린샷 2026-09-19 181220" src="https://github.com/user-attachments/assets/4ff71a29-5013-4e55-9936-af2e9edff341" />
+
+---
+
 ## ⌨️ 단축키 안내 (미디어 편집기)
 
 전문가 수준의 빠른 편집을 위한 단축키를 지원합니다.
@@ -44,10 +71,3 @@
 | `Delete` | 리스트에서 선택한 구간 삭제 |
 
 ---
-
-## 🚀 설치 및 사용 방법
-
-1. [Releases](https://github.com/사용자이름/리포지토리이름/releases) 페이지에서 최신 버전의 `ytdlp_studio.exe` 파일을 다운로드합니다.
-2. 다운로드한 `ytdlp_studio.exe`를 실행합니다.
-3. 다운로더 탭 우측 상단의 **[🛠 필수 도구 설치]** 버튼을 눌러 `yt-dlp 및 FFmpeg 자동 설치`를 진행합니다. (최초 1회만 필요)
-4. 원하는 주소를 입력해 다운로드하거나, 미디어 편집기 탭에 파일을 드래그하여 편집을 시작합니다!
