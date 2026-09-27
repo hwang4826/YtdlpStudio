@@ -62,8 +62,8 @@ class WorkerSignals(QObject):
     finished = pyqtSignal()
     error = pyqtSignal(str)
     update_ui = pyqtSignal()
-    dl_start = pyqtSignal(int)          # [추가됨] 총 다운로드 작업 개수
-    dl_progress = pyqtSignal(int, float) # [추가됨] 작업 번호와 해당 진행률
+    dl_start = pyqtSignal(int)
+    dl_progress = pyqtSignal(int, float)
 
 class ExportSignals(QObject):
     progress = pyqtSignal(str)
@@ -99,6 +99,13 @@ class DownloaderTab(QWidget):
         super().__init__()
         self.total_tasks = 0
         self.task_progress = {}
+        
+        # [추가됨] 취소 및 프로세스 관리를 위한 변수
+        self.is_downloading = False
+        self.cancel_requested = False
+        self.active_processes = []
+        self.proc_lock = threading.Lock()
+        
         self.init_ui()
 
     def init_ui(self):
@@ -174,7 +181,6 @@ class DownloaderTab(QWidget):
         opt_group.setLayout(opt_layout)
         layout.addWidget(opt_group)
 
-        # [추가됨] 시각적 다운로드 진행률 바
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -196,7 +202,9 @@ class DownloaderTab(QWidget):
         btn_layout = QHBoxLayout()
         self.btn_download = QPushButton("다운로드 시작 (병렬 처리)")
         self.btn_download.setMinimumHeight(40)
-        self.btn_download.clicked.connect(self.start_download)
+        
+        # [수정됨] 토글형 방식 연결
+        self.btn_download.clicked.connect(self.toggle_download)
         
         self.btn_update = QPushButton("yt-dlp 수동 업데이트")
         self.btn_update.setMinimumHeight(40)
@@ -243,10 +251,51 @@ class DownloaderTab(QWidget):
         self.log_area.insertPlainText(text)
         self.log_area.verticalScrollBar().setValue(self.log_area.verticalScrollBar().maximum())
 
-    # [수정됨] task_id를 받아 yt-dlp의 텍스트 진행률을 파싱
+    # [수정됨] 토글 방식의 취소/실행 로직
+    def toggle_download(self):
+        if self.is_downloading:
+            self.cancel_download()
+        else:
+            self.start_download()
+
+    def start_download(self):
+        urls = [u.strip() for u in re.split(r'[\n,]+', self.url_text.toPlainText()) if u.strip()]
+        if not urls:
+            QMessageBox.warning(self, "경고", "다운로드할 URL을 입력해주세요.")
+            return
+
+        self.is_downloading = True
+        self.cancel_requested = False
+        self.btn_download.setEnabled(False)
+        self.btn_download.setText("다운로드 준비 중...")
+        threading.Thread(target=self.download_manager, args=(urls,), daemon=True).start()
+
+    def cancel_download(self):
+        self.cancel_requested = True
+        self.signals.log_msg.emit("\n[시스템] 🛑 사용자가 다운로드 취소를 요청했습니다. 프로세스를 정리 중입니다...\n")
+        self.btn_download.setEnabled(False)
+        self.btn_download.setText("취소 처리 중...")
+        self.btn_download.setStyleSheet("")
+        
+        # [강력한 프로세스 강제 종료]
+        with self.proc_lock:
+            for p in self.active_processes:
+                try:
+                    # Windows의 taskkill 옵션 중 /T(Tree)를 사용하여 자식 프로세스(FFmpeg 등)까지 싹 다 날림
+                    subprocess.run(f'taskkill /F /T /PID {p.pid}', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0x08000000)
+                except Exception:
+                    pass
+
+    # [수정됨] 현재 실행 중인 프로세스를 self.active_processes에 담아 관리
     def run_cmd(self, cmd, prefix="", task_id=None):
         process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        
+        with self.proc_lock:
+            self.active_processes.append(process)
+            
         for line in iter(process.stdout.readline, b''):
+            if self.cancel_requested:
+                break # 취소 시 읽기 중단
             try:
                 decoded_line = line.decode('utf-8')
             except UnicodeDecodeError:
@@ -258,8 +307,14 @@ class DownloaderTab(QWidget):
                     self.signals.dl_progress.emit(task_id, float(m.group(1)))
 
             self.signals.log_msg.emit(f"{prefix}{decoded_line}")
+            
         process.stdout.close()
         process.wait()
+        
+        with self.proc_lock:
+            if process in self.active_processes:
+                self.active_processes.remove(process)
+                
         return process.returncode
 
     def install_tools(self):
@@ -306,21 +361,15 @@ class DownloaderTab(QWidget):
             self.btn_update.setEnabled(True)
         threading.Thread(target=_task, daemon=True).start()
 
-    def start_download(self):
-        urls = [u.strip() for u in re.split(r'[\n,]+', self.url_text.toPlainText()) if u.strip()]
-        if not urls:
-            QMessageBox.warning(self, "경고", "다운로드할 URL을 입력해주세요.")
-            return
-
-        threading.Thread(target=self.download_manager, args=(urls,), daemon=True).start()
-
     def download_manager(self, urls):
         self.signals.dl_start.emit(len(urls))
         self.signals.log_msg.emit(f"\n{'='*50}\n🚀 총 {len(urls)}개의 작업을 병렬로 시작합니다!\n{'='*50}\n")
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             futures = [executor.submit(self.download_task, url, idx + 1) for idx, url in enumerate(urls)]
             concurrent.futures.wait(futures)
-        self.signals.log_msg.emit(f"\n{'='*50}\n🎉 모든 다운로드 작업이 완료되었습니다!\n{'='*50}\n")
+        
+        if not self.cancel_requested:
+            self.signals.log_msg.emit(f"\n{'='*50}\n🎉 모든 다운로드 작업이 완료되었습니다!\n{'='*50}\n")
         self.signals.finished.emit()
 
     def on_dl_start(self, total):
@@ -328,15 +377,17 @@ class DownloaderTab(QWidget):
         self.task_progress = {i+1: 0.0 for i in range(total)}
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.btn_download.setEnabled(False)
-        self.btn_download.setText("다운로드 진행 중... (0%)")
+        self.btn_download.setEnabled(True)
+        self.btn_download.setText("다운로드 진행 중... (0%) ❌ 클릭 시 취소")
+        self.btn_download.setStyleSheet("background-color: #8b0000; color: white; font-weight: bold;")
 
     def on_dl_progress(self, task_id, pct):
+        if self.cancel_requested: return
         self.task_progress[task_id] = pct
         if self.total_tasks > 0:
             avg = sum(self.task_progress.values()) / self.total_tasks
             self.progress_bar.setValue(int(avg))
-            self.btn_download.setText(f"다운로드 진행 중... ({int(avg)}%)")
+            self.btn_download.setText(f"다운로드 진행 중... ({int(avg)}%) ❌ 클릭 시 취소")
 
     def get_audio_codec(self, filepath):
         ffprobe = self.get_exe("ffprobe.exe").strip('"')
@@ -348,6 +399,7 @@ class DownloaderTab(QWidget):
             return "aac"
 
     def download_task(self, url, task_id):
+        if self.cancel_requested: return
         prefix = f"[작업 {task_id}] "
         try:
             yt_dlp = self.get_exe("yt-dlp.exe")
@@ -363,7 +415,7 @@ class DownloaderTab(QWidget):
             if self.chk_cookie.isChecked():
                 opts.append(f'--cookies "{self.get_setting("쿠키 파일 (cookies.txt)")}"')
             
-            opts.append("--newline")  # 파이썬으로 진행률을 읽기 위해 한 줄씩 출력 강제
+            opts.append("--newline")  
 
             common_opts = " ".join(opts)
             vid_ext = self.cb_vid_ext.currentText()
@@ -375,7 +427,6 @@ class DownloaderTab(QWidget):
             else:
                 download_fmt = "bv*+ba/b"
 
-            # [수정됨] 다이렉트 m3u8(manifest 등) 링크의 파일명 충돌을 방지하기 위한 번호 부여 로직
             url_lower = url.lower()
             if "manifest" in url_lower or ".m3u8" in url_lower or ".smil" in url_lower:
                 out_tmpl = f"%(title)s_{task_id}.%(ext)s"
@@ -387,6 +438,10 @@ class DownloaderTab(QWidget):
             
             self.signals.log_msg.emit(f"{prefix}📥 다운로드 시작...\n")
             self.run_cmd(cmd, prefix, task_id)
+            
+            if self.cancel_requested:
+                self.signals.log_msg.emit(f"{prefix}🛑 작업 취소됨\n")
+                return
             
             if self.chk_audio.isChecked():
                 self.extract_audio_task(vid_path, prefix)
@@ -430,10 +485,13 @@ class DownloaderTab(QWidget):
             except: pass
 
     def download_finished(self):
+        self.is_downloading = False
+        self.cancel_requested = False
         self.btn_download.setEnabled(True)
         self.btn_download.setText("다운로드 시작 (병렬 처리)")
+        self.btn_download.setStyleSheet("")
         self.progress_bar.setVisible(False)
-        QMessageBox.information(self, "완료", "모든 작업이 완료되었습니다.")
+        QMessageBox.information(self, "알림", "다운로드 작업이 완료되었거나 취소되었습니다.")
 
 
 # ==========================================
@@ -1355,7 +1413,6 @@ class TagEditorTab(QWidget):
     def init_ui(self):
         main_layout = QHBoxLayout()
 
-        # 왼쪽: 파일 리스트 (다중 선택 지원)
         left_layout = QVBoxLayout()
         self.list_files = QListWidget()
         self.list_files.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -1376,7 +1433,6 @@ class TagEditorTab(QWidget):
         left_layout.addLayout(btn_layout)
         main_layout.addLayout(left_layout, stretch=1)
 
-        # 오른쪽: 태그 에디터 폼
         right_layout = QVBoxLayout()
         if not MUTAGEN_AVAILABLE:
             right_layout.addWidget(QLabel("⚠️ 'mutagen' 라이브러리가 설치되지 않아 태그 편집기를 사용할 수 없습니다.\ncmd 창에서 'pip install mutagen'을 실행해주세요."))
@@ -1387,7 +1443,6 @@ class TagEditorTab(QWidget):
         form_group = QGroupBox("메타데이터 정보 (선택된 파일에 반영됩니다)")
         grid = QGridLayout()
         
-        # 필드 생성 헬퍼
         self.fields = {}
         row = 0
         def add_field(key, label_text, is_combo=False):
@@ -1416,7 +1471,6 @@ class TagEditorTab(QWidget):
         add_field('track', "7. 곡 번호 (#):", False)
         add_field('disc', "8. 디스크 번호:", False)
 
-        # 앨범아트
         art_layout = QVBoxLayout()
         self.lbl_art = AlbumArtLabel()
         self.lbl_art.file_dropped.connect(self.load_album_art)
@@ -1432,7 +1486,6 @@ class TagEditorTab(QWidget):
         form_group.setLayout(grid)
         right_layout.addWidget(form_group)
 
-        # 파일명 기반 스마트 파서
         parse_group = QGroupBox("파일명으로 정보 자동 추출 (- 기호 기준)")
         parse_layout = QHBoxLayout()
         
@@ -1455,7 +1508,6 @@ class TagEditorTab(QWidget):
         parse_group.setLayout(parse_layout)
         right_layout.addWidget(parse_group)
 
-        # 저장 버튼
         self.btn_save = QPushButton("현재 폼에 적힌 정보를 파일에 저장")
         self.btn_save.setMinimumHeight(50)
         self.btn_save.clicked.connect(self.save_current_tags)
@@ -1559,7 +1611,6 @@ class TagEditorTab(QWidget):
         if not items: return
         data = self.get_form_data()
         
-        # 히스토리 업데이트
         self.update_history('artist', data['artist'])
         self.update_history('album_artist', data['album_artist'])
         self.update_history('album', data['album'])
@@ -1597,7 +1648,6 @@ class TagEditorTab(QWidget):
         items = self.list_files.selectedItems()
         if not items: return
         
-        # 체크된 파서 형식 순서 가져오기
         format_keys = []
         for i in range(self.format_list.count()):
             item = self.format_list.item(i)
@@ -1628,7 +1678,6 @@ class TagEditorTab(QWidget):
         self.on_file_selected() 
         QMessageBox.information(self, "완료", f"{count}개의 파일에 자동 추출 태그를 적용했습니다.")
 
-    # --- Mutagen 코어 함수 ---
     def _read_tags(self, path):
         res = {}
         try:
@@ -1750,7 +1799,7 @@ class TagEditorTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("yt-dlp 미디어 통합 매니저")
+        self.setWindowTitle("yt-dlp 미디어 통합 매니저 v1.1.0")
         self.resize(1000, 800)
         
         screen_geo = QApplication.primaryScreen().availableGeometry()
@@ -1772,6 +1821,23 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tag_tab, "🎵 음원 태그 편집기")
         
         self.statusBar().showMessage("준비 완료")
+
+    # [추가됨] 프로그램 종료 시 안전 검사 로직
+    def closeEvent(self, event):
+        if self.downloader_tab.is_downloading:
+            reply = QMessageBox.question(
+                self, '프로그램 종료 경고',
+                '현재 백그라운드에서 다운로드가 진행 중입니다.\n\n다운로드를 강제로 중단하고 프로그램을 종료하시겠습니까?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.downloader_tab.cancel_download()
+                event.accept()
+            else:
+                event.ignore()
+        else:
+            event.accept()
 
 
 def resource_path(relative_path):
