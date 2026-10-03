@@ -59,7 +59,7 @@ class Config:
 # ==========================================
 class WorkerSignals(QObject):
     log_msg = pyqtSignal(str)
-    finished = pyqtSignal()
+    finished = pyqtSignal(int, int, int) # [성공, 오류, 취소] 개수 전달
     error = pyqtSignal(str)
     update_ui = pyqtSignal()
     dl_start = pyqtSignal(int)
@@ -73,7 +73,7 @@ class ExtractorSignals(QObject):
     item_status = pyqtSignal(int, str)
     progress = pyqtSignal(int, float)
     total_start = pyqtSignal(int)
-    finished = pyqtSignal(bool, str)
+    finished = pyqtSignal(int, int, int) # [성공, 오류, 취소] 개수 전달
 
 # ==========================================
 # 공통 UI 컴포넌트
@@ -105,11 +105,13 @@ class DownloaderTab(QWidget):
         super().__init__()
         self.total_tasks = 0
         self.task_progress = {}
+        self.task_stats = {'success': 0, 'error': 0, 'canceled': 0}
         
         self.is_downloading = False
         self.cancel_requested = False
         self.active_processes = []
         self.proc_lock = threading.Lock()
+        self.stats_lock = threading.Lock()
         
         self.init_ui()
 
@@ -119,10 +121,10 @@ class DownloaderTab(QWidget):
         url_group = QGroupBox("다운로드 주소 입력 (엔터 또는 쉼표로 다중 입력)")
         url_layout = QVBoxLayout()
         self.url_text = QTextEdit()
-        self.url_text.setFixedHeight(80)
+        self.url_text.setMinimumHeight(120)  
         url_layout.addWidget(self.url_text)
         url_group.setLayout(url_layout)
-        layout.addWidget(url_group)
+        layout.addWidget(url_group, stretch=2)
 
         path_group = QGroupBox("설정 및 경로 (비워두면 시스템 기본 폴더 자동 적용)")
         path_layout = QVBoxLayout()
@@ -130,32 +132,42 @@ class DownloaderTab(QWidget):
         top_row_layout = QHBoxLayout()
         top_row_layout.addStretch() 
         
+        btn_github = QPushButton("⭐ GitHub")
+        btn_github.clicked.connect(lambda: webbrowser.open("https://github.com/hwang4826/YtdlpStudio"))
+        top_row_layout.addWidget(btn_github)
+
         self.btn_install_menu = QPushButton("🛠 필수 도구 설치")
         install_menu = QMenu()
-        
         action_install_tools = install_menu.addAction("yt-dlp 및 FFmpeg 자동 설치")
         action_install_tools.triggered.connect(self.install_tools)
-        
         action_install_node = install_menu.addAction("Node.js 공식 다운로드 페이지 열기")
         action_install_node.triggered.connect(lambda: webbrowser.open("https://nodejs.org/ko/download/"))
-        
         self.btn_install_menu.setMenu(install_menu)
         top_row_layout.addWidget(self.btn_install_menu)
+        
         path_layout.addLayout(top_row_layout)
 
+        grid = QGridLayout()
         self.path_entries = {}
-        for key, default_val in Config.DEFAULT_PATHS.items():
-            row_layout = QHBoxLayout()
-            row_layout.addWidget(QLabel(key))
+        
+        grid_items = [
+            ("도구 폴더 (yt-dlp, FFmpeg)", 0, 0),
+            ("영상 저장 폴더", 0, 3),
+            ("Node.js (node.exe)", 1, 0),
+            ("음원 저장 폴더", 1, 3)
+        ]
+
+        for key, row, col in grid_items:
+            grid.addWidget(QLabel(key), row, col)
             entry = QLineEdit()
-            entry.setPlaceholderText(default_val)
+            entry.setPlaceholderText(Config.DEFAULT_PATHS[key])
             self.path_entries[key] = entry
-            row_layout.addWidget(entry)
+            grid.addWidget(entry, row, col + 1)
             btn_browse = QPushButton("찾아보기")
             btn_browse.clicked.connect(lambda checked, k=key: self.browse_path(k))
-            row_layout.addWidget(btn_browse)
-            path_layout.addLayout(row_layout)
+            grid.addWidget(btn_browse, row, col + 2)
             
+        path_layout.addLayout(grid)
         path_group.setLayout(path_layout)
         layout.addWidget(path_group)
 
@@ -167,21 +179,41 @@ class DownloaderTab(QWidget):
         self.cb_vid_ext = QComboBox()
         self.cb_vid_ext.addItems(["추천", "mp4", "webm", "mkv", "ts"])
         
-        self.chk_audio = QCheckBox("음원 다운로드 (추출)")
+        self.chk_audio = QCheckBox("음원 추출")
         self.cb_aud_ext = QComboBox()
         self.cb_aud_ext.addItems(["추천", "mp3", "m4a", "aac", "opus"])
         
+        self.chk_playlist = QCheckBox("재생목록 전체 다운로드")
+        
         self.chk_cookie = QCheckBox("쿠키 사용")
+        self.entry_cookie = QLineEdit()
+        self.entry_cookie.setPlaceholderText(Config.DEFAULT_PATHS["쿠키 파일 (cookies.txt)"])
+        self.entry_cookie.setVisible(False)
+        self.path_entries["쿠키 파일 (cookies.txt)"] = self.entry_cookie
+        
+        self.btn_cookie = QPushButton("찾아보기")
+        self.btn_cookie.setVisible(False)
+        self.btn_cookie.clicked.connect(lambda checked, k="쿠키 파일 (cookies.txt)": self.browse_path(k))
+        
+        self.chk_cookie.toggled.connect(self.entry_cookie.setVisible)
+        self.chk_cookie.toggled.connect(self.btn_cookie.setVisible)
 
         opt_layout.addWidget(self.chk_video)
-        opt_layout.addWidget(QLabel("영상 확장자:"))
         opt_layout.addWidget(self.cb_vid_ext)
-        opt_layout.addSpacing(20)
+        opt_layout.addSpacing(15)
         opt_layout.addWidget(self.chk_audio)
-        opt_layout.addWidget(QLabel("음원 확장자:"))
         opt_layout.addWidget(self.cb_aud_ext)
-        opt_layout.addSpacing(20)
-        opt_layout.addWidget(self.chk_cookie)
+        opt_layout.addSpacing(15)
+        opt_layout.addWidget(self.chk_playlist)
+        opt_layout.addSpacing(15)
+        
+        cookie_layout = QHBoxLayout()
+        cookie_layout.addWidget(self.chk_cookie)
+        cookie_layout.addWidget(self.entry_cookie)
+        cookie_layout.addWidget(self.btn_cookie)
+        cookie_layout.setContentsMargins(0, 0, 0, 0)
+        
+        opt_layout.addLayout(cookie_layout)
         opt_layout.addStretch()
         opt_group.setLayout(opt_layout)
         layout.addWidget(opt_group)
@@ -216,7 +248,7 @@ class DownloaderTab(QWidget):
         self.log_area.setStyleSheet("background-color: black; color: #00FF00; font-family: Consolas;")
         log_layout.addWidget(self.log_area)
         log_group.setLayout(log_layout)
-        layout.addWidget(log_group)
+        layout.addWidget(log_group, stretch=1)
 
         self.setLayout(layout)
         self.signals = WorkerSignals()
@@ -253,13 +285,23 @@ class DownloaderTab(QWidget):
             self.start_download()
 
     def start_download(self):
-        urls = [u.strip() for u in re.split(r'[\n,]+', self.url_text.toPlainText()) if u.strip()]
-        if not urls:
+        raw_urls = [u.strip() for u in re.split(r'[\n,]+', self.url_text.toPlainText()) if u.strip()]
+        if not raw_urls:
             QMessageBox.warning(self, "경고", "다운로드할 URL을 입력해주세요.")
             return
 
+        urls = []
+        for u in raw_urls:
+            if not self.chk_playlist.isChecked():
+                u = re.sub(r'&list=[^&]+', '', u)
+                u = re.sub(r'&index=\d+', '', u)
+            urls.append(u)
+
         self.is_downloading = True
         self.cancel_requested = False
+        with self.stats_lock:
+            self.task_stats = {'success': 0, 'error': 0, 'canceled': 0}
+            
         self.btn_download.setEnabled(False)
         self.btn_download.setText("다운로드 준비 중...")
         threading.Thread(target=self.download_manager, args=(urls,), daemon=True).start()
@@ -284,6 +326,8 @@ class DownloaderTab(QWidget):
         with self.proc_lock:
             self.active_processes.append(process)
             
+        downloaded_file = None
+            
         for line in iter(process.stdout.readline, b''):
             if self.cancel_requested:
                 break 
@@ -297,6 +341,13 @@ class DownloaderTab(QWidget):
                 if m:
                     self.signals.dl_progress.emit(task_id, float(m.group(1)))
 
+            m_dest = re.search(r'Destination:\s*(.+)$', decoded_line)
+            m_merge = re.search(r'Merging formats into\s*"(.+)"', decoded_line)
+            if m_merge:
+                downloaded_file = m_merge.group(1).strip()
+            elif m_dest and not downloaded_file:
+                downloaded_file = m_dest.group(1).strip()
+
             self.signals.log_msg.emit(f"{prefix}{decoded_line}")
             
         process.stdout.close()
@@ -306,7 +357,7 @@ class DownloaderTab(QWidget):
             if process in self.active_processes:
                 self.active_processes.remove(process)
                 
-        return process.returncode
+        return process.returncode, downloaded_file
 
     def install_tools(self):
         def _task():
@@ -361,7 +412,7 @@ class DownloaderTab(QWidget):
         
         if not self.cancel_requested:
             self.signals.log_msg.emit(f"\n{'='*50}\n🎉 모든 다운로드 작업이 완료되었습니다!\n{'='*50}\n")
-        self.signals.finished.emit()
+        self.signals.finished.emit(self.task_stats['success'], self.task_stats['error'], self.task_stats['canceled'])
 
     def on_dl_start(self, total):
         self.total_tasks = total
@@ -390,7 +441,10 @@ class DownloaderTab(QWidget):
             return "aac"
 
     def download_task(self, url, task_id):
-        if self.cancel_requested: return
+        if self.cancel_requested: 
+            with self.stats_lock: self.task_stats['canceled'] += 1
+            return
+            
         prefix = f"[작업 {task_id}] "
         try:
             yt_dlp = self.get_exe("yt-dlp.exe")
@@ -405,6 +459,9 @@ class DownloaderTab(QWidget):
                 
             if self.chk_cookie.isChecked():
                 opts.append(f'--cookies "{self.get_setting("쿠키 파일 (cookies.txt)")}"')
+            
+            if not self.chk_playlist.isChecked():
+                opts.append("--no-playlist")
             
             opts.append("--newline")  
 
@@ -428,27 +485,37 @@ class DownloaderTab(QWidget):
             cmd = f'{yt_dlp} {common_opts} {ext_opt} -f "{download_fmt}" -o "{vid_path}" "{url}"'
             
             self.signals.log_msg.emit(f"{prefix}📥 다운로드 시작...\n")
-            self.run_cmd(cmd, prefix, task_id)
+            
+            retcode, downloaded_file = self.run_cmd(cmd, prefix, task_id)
             
             if self.cancel_requested:
                 self.signals.log_msg.emit(f"{prefix}🛑 작업 취소됨\n")
+                with self.stats_lock: self.task_stats['canceled'] += 1
+                return
+                
+            if retcode != 0:
+                self.signals.log_msg.emit(f"{prefix}❌ 다운로드 실패\n")
+                with self.stats_lock: self.task_stats['error'] += 1
                 return
             
             if self.chk_audio.isChecked():
-                self.extract_audio_task(vid_path, prefix)
+                if downloaded_file and os.path.exists(downloaded_file):
+                    self.extract_audio_task_safe(downloaded_file, prefix)
+                else:
+                    self.signals.log_msg.emit(f"{prefix}⚠️️ 정확한 파일명을 찾지 못해 추출에 실패했습니다.\n")
+                    with self.stats_lock: self.task_stats['error'] += 1
+                    return
 
             self.signals.log_msg.emit(f"{prefix}✨ 완료되었습니다!\n")
+            with self.stats_lock: self.task_stats['success'] += 1
+            
         except Exception as e:
             self.signals.log_msg.emit(f"{prefix}❌ 오류: {str(e)}\n")
+            with self.stats_lock: self.task_stats['error'] += 1
 
-    def extract_audio_task(self, template_path, prefix):
-        base_dir = os.path.dirname(template_path)
-        files = glob.glob(os.path.join(base_dir, "*"))
-        if not files: return
-        latest_file = max(files, key=os.path.getctime)
-        
+    def extract_audio_task_safe(self, exact_file, prefix):
         aud_ext = self.cb_aud_ext.currentText()
-        original_codec = self.get_audio_codec(latest_file)
+        original_codec = self.get_audio_codec(exact_file)
         
         if aud_ext == "추천":
             if original_codec == "opus": out_ext = "opus"
@@ -457,32 +524,40 @@ class DownloaderTab(QWidget):
         else:
             out_ext = aud_ext
             
-        name = os.path.splitext(os.path.basename(latest_file))[0]
+        name = os.path.splitext(os.path.basename(exact_file))[0]
         output_file = os.path.join(self.get_setting("음원 저장 폴더"), f"{name}.{out_ext}")
         
         ffmpeg = self.get_exe("ffmpeg.exe")
         is_compatible = (aud_ext == "추천") or (out_ext == "opus" and original_codec == "opus") or (out_ext == "mp3" and original_codec == "mp3") or (out_ext == "m4a" and original_codec == "aac")
                         
         if is_compatible:
-            ffmpeg_cmd = f'{ffmpeg} -y -i "{latest_file}" -vn -c:a copy "{output_file}"'
+            ffmpeg_cmd = f'{ffmpeg} -y -i "{exact_file}" -vn -c:a copy "{output_file}"'
         else:
-            ffmpeg_cmd = f'{ffmpeg} -y -i "{latest_file}" -vn -b:a 192k "{output_file}"'
+            ffmpeg_cmd = f'{ffmpeg} -y -i "{exact_file}" -vn -b:a 192k "{output_file}"'
         
         self.signals.log_msg.emit(f"{prefix}🎵 음원 추출 진행 중...\n")
+        
         self.run_cmd(ffmpeg_cmd, prefix)
         
         if not self.chk_video.isChecked():
-            try: os.remove(latest_file)
+            try: os.remove(exact_file)
             except: pass
 
-    def download_finished(self):
+    def download_finished(self, success, error, canceled):
         self.is_downloading = False
         self.cancel_requested = False
         self.btn_download.setEnabled(True)
         self.btn_download.setText("다운로드 시작 (병렬 처리)")
         self.btn_download.setStyleSheet("")
         self.progress_bar.setVisible(False)
-        QMessageBox.information(self, "알림", "다운로드 작업이 완료되었거나 취소되었습니다.")
+        
+        if self.total_tasks > 0:
+            if canceled > 0 and success == 0 and error == 0:
+                QMessageBox.information(self, "취소됨", "다운로드 작업이 취소되었습니다.")
+            elif error > 0:
+                QMessageBox.warning(self, "완료 (오류 발생)", f"총 {success + error}개 작업 중\n{success}개 성공, {error}개 실패했습니다.")
+            else:
+                QMessageBox.information(self, "완료", f"총 {success}개의 다운로드 작업이 성공적으로 완료되었습니다.")
 
 
 # ==========================================
@@ -1049,7 +1124,6 @@ class EditorTab(QWidget):
         out_dir = self.entry_out_dir.text().strip()
         custom_name = self.entry_out_name.text().strip()
         
-        # [버그 수정됨] 추천 포맷일 경우 원본 코덱 분석 후 적절한 확장자 할당
         if is_audio and audio_ext == "추천":
             ffprobe = self.main_window.downloader_tab.get_exe("ffprobe.exe").strip('"')
             cmd_probe = f'"{ffprobe}" -v error -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "{self.current_file}"'
@@ -1083,12 +1157,13 @@ class EditorTab(QWidget):
         self.btn_export.setEnabled(True)
         self.btn_export.setText("내보내기 실행")
         self.btn_export.setStyleSheet("")
-        if success:
-            if hasattr(self.main_window, "metaObject"):
-                self.main_window.statusBar().showMessage("미디어 내보내기가 완료되었거나 취소되었습니다.", 5000)
+        
+        if self.cancel_requested:
+            QMessageBox.information(self, "취소됨", "미디어 내보내기 작업이 취소되었습니다.")
+        elif success:
+            QMessageBox.information(self, "완료", "미디어 내보내기가 성공적으로 완료되었습니다.")
         else:
-            if hasattr(self.main_window, "metaObject"):
-                self.main_window.statusBar().showMessage(f"내보내기 오류: {msg[:50]}", 5000)
+            QMessageBox.warning(self, "오류", f"내보내기 중 오류가 발생했습니다:\n{msg}")
 
     def _export_task(self, input_file, sections, is_audio, audio_ext, is_merge, is_precision, out_dir, custom_name, signals):
         ffmpeg = self.main_window.downloader_tab.get_exe("ffmpeg.exe").strip('"')
@@ -1496,12 +1571,13 @@ class MergerTab(QWidget):
         self.btn_export.setEnabled(True)
         self.btn_export.setText("병합 실행")
         self.btn_export.setStyleSheet("")
-        if success:
-            if hasattr(self.main_window, "metaObject"):
-                self.main_window.statusBar().showMessage("비디오 병합이 완료되었거나 취소되었습니다.", 5000)
+        
+        if self.cancel_requested:
+            QMessageBox.information(self, "취소됨", "비디오 병합 작업이 취소되었습니다.")
+        elif success:
+            QMessageBox.information(self, "완료", "비디오 병합 작업이 성공적으로 완료되었습니다.")
         else:
-            if hasattr(self.main_window, "metaObject"):
-                self.main_window.statusBar().showMessage(f"병합 오류: {msg[:50]}", 5000)
+            QMessageBox.warning(self, "오류", f"병합 중 오류가 발생했습니다:\n{msg}")
 
     def _merge_task(self, out_path, res_mode, fps_mode, signals):
         ffmpeg = self.main_window.downloader_tab.get_exe("ffmpeg.exe").strip('"')
@@ -1562,7 +1638,7 @@ class MergerTab(QWidget):
 
 
 # ==========================================
-# 6. 탭 4: 음원 일괄 추출기 (신규)
+# 6. 탭 4: 음원 일괄 추출기
 # ==========================================
 class ExtractorTab(QWidget):
     def __init__(self, main_window):
@@ -1572,9 +1648,11 @@ class ExtractorTab(QWidget):
         self.cancel_requested = False
         self.active_processes = []
         self.proc_lock = threading.Lock()
+        self.stats_lock = threading.Lock()
         
         self.total_tasks = 0
         self.task_progress = {}
+        self.task_stats = {'success': 0, 'error': 0, 'canceled': 0}
         
         self.setAcceptDrops(True)
         self.init_ui()
@@ -1699,6 +1777,9 @@ class ExtractorTab(QWidget):
 
         self.is_extracting = True
         self.cancel_requested = False
+        with self.stats_lock:
+            self.task_stats = {'success': 0, 'error': 0, 'canceled': 0}
+            
         self.btn_export.setText("음원 일괄 추출 준비 중... ❌ 클릭 시 취소")
         self.btn_export.setStyleSheet("background-color: #8b0000; color: white; font-weight: bold;")
         self.progress_bar.setValue(0)
@@ -1733,16 +1814,21 @@ class ExtractorTab(QWidget):
             self.progress_bar.setValue(int(avg))
             self.btn_export.setText(f"음원 일괄 추출 진행 중... ({int(avg)}%) ❌ 클릭 시 취소")
 
-    def on_finished(self, success, msg):
+    def on_finished(self, success, error, canceled):
         self.is_extracting = False
         self.cancel_requested = False
         self.progress_bar.setVisible(False)
         self.btn_export.setEnabled(True)
         self.btn_export.setText("음원 일괄 추출 실행")
         self.btn_export.setStyleSheet("")
-        if success:
-            if hasattr(self.main_window, "metaObject"):
-                self.main_window.statusBar().showMessage("음원 추출 작업이 완료되었거나 취소되었습니다.", 5000)
+        
+        if self.total_tasks > 0:
+            if canceled > 0 and success == 0 and error == 0:
+                QMessageBox.information(self, "취소됨", "음원 일괄 추출 작업이 취소되었습니다.")
+            elif error > 0:
+                QMessageBox.warning(self, "완료 (오류 발생)", f"총 {success + error}개 작업 중\n{success}개 성공, {error}개 실패했습니다.")
+            else:
+                QMessageBox.information(self, "완료", f"총 {success}개의 음원 추출 작업이 성공적으로 완료되었습니다.")
 
     def extractor_manager(self, files, out_dir, aud_ext, signals):
         signals.total_start.emit(len(files))
@@ -1752,10 +1838,14 @@ class ExtractorTab(QWidget):
             futures = [executor.submit(self.extract_single, path, i, out_dir, aud_ext, signals) for i, path in enumerate(files)]
             concurrent.futures.wait(futures)
             
-        signals.finished.emit(not self.cancel_requested, "작업 종료")
+        signals.finished.emit(self.task_stats['success'], self.task_stats['error'], self.task_stats['canceled'])
 
     def extract_single(self, path, task_idx, out_dir, aud_ext, signals):
-        if self.cancel_requested: return
+        if self.cancel_requested:
+            with self.stats_lock: self.task_stats['canceled'] += 1
+            signals.item_status.emit(task_idx, "취소됨")
+            return
+            
         signals.item_status.emit(task_idx, "추출 중...")
         
         ffmpeg = self.main_window.downloader_tab.get_exe("ffmpeg.exe").strip('"')
@@ -1807,16 +1897,20 @@ class ExtractorTab(QWidget):
                     self.active_processes.remove(process)
                     
             if self.cancel_requested:
+                with self.stats_lock: self.task_stats['canceled'] += 1
                 signals.item_status.emit(task_idx, "취소됨")
                 return
                 
             if process.returncode == 0:
+                with self.stats_lock: self.task_stats['success'] += 1
                 signals.progress.emit(task_idx, 100.0)
                 signals.item_status.emit(task_idx, "완료")
             else:
+                with self.stats_lock: self.task_stats['error'] += 1
                 signals.item_status.emit(task_idx, "오류")
                 
         except Exception as e:
+            with self.stats_lock: self.task_stats['error'] += 1
             signals.item_status.emit(task_idx, "오류")
 
 
