@@ -66,7 +66,7 @@ class WorkerSignals(QObject):
     dl_progress = pyqtSignal(int, float)
 
 class ExportSignals(QObject):
-    progress = pyqtSignal(str)
+    progress = pyqtSignal(int, str)
     finished = pyqtSignal(bool, str)
 
 # ==========================================
@@ -100,7 +100,6 @@ class DownloaderTab(QWidget):
         self.total_tasks = 0
         self.task_progress = {}
         
-        # [추가됨] 취소 및 프로세스 관리를 위한 변수
         self.is_downloading = False
         self.cancel_requested = False
         self.active_processes = []
@@ -202,8 +201,6 @@ class DownloaderTab(QWidget):
         btn_layout = QHBoxLayout()
         self.btn_download = QPushButton("다운로드 시작 (병렬 처리)")
         self.btn_download.setMinimumHeight(40)
-        
-        # [수정됨] 토글형 방식 연결
         self.btn_download.clicked.connect(self.toggle_download)
         
         self.btn_update = QPushButton("yt-dlp 수동 업데이트")
@@ -251,7 +248,6 @@ class DownloaderTab(QWidget):
         self.log_area.insertPlainText(text)
         self.log_area.verticalScrollBar().setValue(self.log_area.verticalScrollBar().maximum())
 
-    # [수정됨] 토글 방식의 취소/실행 로직
     def toggle_download(self):
         if self.is_downloading:
             self.cancel_download()
@@ -277,16 +273,13 @@ class DownloaderTab(QWidget):
         self.btn_download.setText("취소 처리 중...")
         self.btn_download.setStyleSheet("")
         
-        # [강력한 프로세스 강제 종료]
         with self.proc_lock:
             for p in self.active_processes:
                 try:
-                    # Windows의 taskkill 옵션 중 /T(Tree)를 사용하여 자식 프로세스(FFmpeg 등)까지 싹 다 날림
                     subprocess.run(f'taskkill /F /T /PID {p.pid}', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0x08000000)
                 except Exception:
                     pass
 
-    # [수정됨] 현재 실행 중인 프로세스를 self.active_processes에 담아 관리
     def run_cmd(self, cmd, prefix="", task_id=None):
         process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
         
@@ -295,7 +288,7 @@ class DownloaderTab(QWidget):
             
         for line in iter(process.stdout.readline, b''):
             if self.cancel_requested:
-                break # 취소 시 읽기 중단
+                break 
             try:
                 decoded_line = line.decode('utf-8')
             except UnicodeDecodeError:
@@ -505,6 +498,7 @@ class EditorTimelineSlider(QSlider):
         self.temp_section = None 
         self.duration_ms = 0
         self.player_ref = None
+        self.format_time_ref = None
 
     def set_sections(self, sections_data):
         self.sections = sections_data
@@ -517,9 +511,6 @@ class EditorTimelineSlider(QSlider):
     def set_duration(self, duration):
         self.duration_ms = duration
         self.setRange(0, duration)
-
-    def format_time(self, ms):
-        return QTime(0, 0, 0).addMSecs(ms).toString("hh:mm:ss")
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -538,8 +529,8 @@ class EditorTimelineSlider(QSlider):
             rect = QRect(x1, 2, max(1, x2 - x1), height - 4)
             painter.fillRect(rect, color)
             
-            s_text = self.format_time(start_ms)
-            e_text = self.format_time(end_ms)
+            s_text = self.format_time_ref(start_ms) if self.format_time_ref else QTime(0, 0, 0).addMSecs(start_ms).toString("hh:mm:ss")
+            e_text = self.format_time_ref(end_ms) if self.format_time_ref else QTime(0, 0, 0).addMSecs(end_ms).toString("hh:mm:ss")
             fm = painter.fontMetrics()
             text_w = fm.horizontalAdvance(s_text)
             if rect.width() > text_w * 2.5:
@@ -562,7 +553,9 @@ class EditorTimelineSlider(QSlider):
         hover_ms = int((hover_x / self.width()) * self.duration_ms)
         for s, e, _ in self.sections:
             if s <= hover_ms <= e:
-                QToolTip.showText(event.globalPosition().toPoint(), f"{self.format_time(s)} ~ {self.format_time(e)}", self)
+                s_fmt = self.format_time_ref(s) if self.format_time_ref else s
+                e_fmt = self.format_time_ref(e) if self.format_time_ref else e
+                QToolTip.showText(event.globalPosition().toPoint(), f"{s_fmt} ~ {e_fmt}", self)
                 return
         QToolTip.hideText()
 
@@ -623,8 +616,14 @@ class EditorTab(QWidget):
         self.keyframes = [] 
         self.marking_start_ms = None 
         self.sections_list = [] 
-        self.setAcceptDrops(True)
         self.colors = [QColor(255, 50, 50, 150), QColor(50, 255, 50, 150), QColor(50, 50, 255, 150), QColor(255, 200, 0, 150), QColor(200, 50, 255, 150)]
+        self.setAcceptDrops(True)
+        
+        self.is_exporting = False
+        self.cancel_requested = False
+        self.active_processes = []
+        self.proc_lock = threading.Lock()
+        
         self.init_ui()
         self.setup_shortcuts()
 
@@ -669,8 +668,9 @@ class EditorTab(QWidget):
         control_layout = QHBoxLayout()
         self.slider = EditorTimelineSlider(Qt.Orientation.Horizontal)
         self.slider.player_ref = self.player
+        self.slider.format_time_ref = self.format_time
         self.slider.sliderMoved.connect(self.set_position)
-        self.lbl_time = QLabel("00:00:00 / 00:00:00")
+        self.lbl_time = QLabel("00:00:00.0 / 00:00:00.0")
         control_layout.addWidget(self.slider)
         control_layout.addWidget(self.lbl_time)
         layout.addLayout(control_layout)
@@ -705,16 +705,18 @@ class EditorTab(QWidget):
 
         manual_layout = QVBoxLayout()
         time_input_layout = QHBoxLayout()
-        self.entry_start = QLineEdit("00:00:00.000")
-        self.entry_end = QLineEdit("00:00:00.000")
+        self.entry_start = QLineEdit("00:00:00.0")
+        self.entry_end = QLineEdit("00:00:00.0")
         time_input_layout.addWidget(QLabel("시작:"))
         time_input_layout.addWidget(self.entry_start)
         time_input_layout.addWidget(QLabel("종료:"))
         time_input_layout.addWidget(self.entry_end)
         manual_layout.addLayout(time_input_layout)
         
-        self.chk_precision = QCheckBox("정밀 자르기 (재인코딩)")
+        self.chk_precision = QCheckBox("정밀 자르기 (재인코딩/0.001초 제어)")
+        self.chk_precision.stateChanged.connect(self.on_precision_changed)
         manual_layout.addWidget(self.chk_precision)
+        
         self.chk_merge = QCheckBox("리스트 모든 구간 병합")
         self.chk_merge.setChecked(True)
         manual_layout.addWidget(self.chk_merge)
@@ -741,15 +743,37 @@ class EditorTab(QWidget):
         export_setting_layout.addWidget(self.entry_out_name, stretch=2)
         manual_layout.addLayout(export_setting_layout)
 
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar { border: 1px solid #555; border-radius: 5px; text-align: center; height: 20px; }
+            QProgressBar::chunk { background-color: #00aa00; width: 10px; }
+        """)
+        manual_layout.addWidget(self.progress_bar)
+
         self.btn_export = QPushButton("내보내기 실행")
         self.btn_export.setMinimumHeight(40)
-        self.btn_export.clicked.connect(self.execute_export)
+        self.btn_export.clicked.connect(self.toggle_export)
         manual_layout.addWidget(self.btn_export)
 
         cut_layout.addLayout(manual_layout, stretch=1)
         cut_group.setLayout(cut_layout)
         layout.addWidget(cut_group)
         self.setLayout(layout)
+
+    def on_precision_changed(self):
+        self.refresh_section_list_ui()
+        if self.player.duration() > 0:
+            self.update_time_label(self.player.position(), self.player.duration())
+        try:
+            s_ms = self.time_to_ms(self.entry_start.text())
+            e_ms = self.time_to_ms(self.entry_end.text())
+            self.entry_start.setText(self.format_time(s_ms))
+            self.entry_end.setText(self.format_time(e_ms))
+        except:
+            pass
 
     def change_out_dir(self):
         path = QFileDialog.getExistingDirectory(self, "저장 폴더 선택", self.entry_out_dir.text() or Config.DEFAULT_PATHS["영상 저장 폴더"])
@@ -771,12 +795,12 @@ class EditorTab(QWidget):
 
     def setup_shortcuts(self):
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, self.toggle_play)
-        QShortcut(QKeySequence(Qt.Key.Key_Left), self, lambda: self.seek(-5000))
-        QShortcut(QKeySequence(Qt.Key.Key_Right), self, lambda: self.seek(5000))
-        QShortcut(QKeySequence(Qt.Key.Key_Up), self, lambda: self.seek(60000))
-        QShortcut(QKeySequence(Qt.Key.Key_Down), self, lambda: self.seek(-60000))
-        QShortcut(QKeySequence("Shift+Left"), self, lambda: self.seek_keyframe(-1))
-        QShortcut(QKeySequence("Shift+Right"), self, lambda: self.seek_keyframe(1))
+        QShortcut(QKeySequence(Qt.Key.Key_Left), self, lambda: self.seek(-1000))
+        QShortcut(QKeySequence(Qt.Key.Key_Right), self, lambda: self.seek(1000))
+        QShortcut(QKeySequence(Qt.Key.Key_Up), self, lambda: self.seek(-60000))
+        QShortcut(QKeySequence(Qt.Key.Key_Down), self, lambda: self.seek(60000))
+        QShortcut(QKeySequence("Shift+Left"), self, lambda: self.seek(-100))
+        QShortcut(QKeySequence("Shift+Right"), self, lambda: self.seek(100))
         QShortcut(QKeySequence("Ctrl+Left"), self, lambda: self.jump_section(-1))
         QShortcut(QKeySequence("Ctrl+Right"), self, lambda: self.jump_section(1))
         QShortcut(QKeySequence("["), self, self.mark_start)
@@ -877,8 +901,24 @@ class EditorTab(QWidget):
 
     def set_position(self, position): self.player.setPosition(position)
 
-    def format_time(self, ms): return QTime(0, 0, 0).addMSecs(ms).toString("hh:mm:ss.zzz")
-    def time_to_ms(self, t_str): return QTime.fromString(t_str, "hh:mm:ss.zzz").msecsSinceStartOfDay()
+    def format_time(self, ms): 
+        t = QTime(0, 0, 0).addMSecs(ms)
+        base = t.toString("hh:mm:ss")
+        if self.chk_precision.isChecked():
+            return f"{base}.{ms % 1000:03d}"
+        else:
+            return f"{base}.{(ms % 1000) // 100:01d}"
+
+    def time_to_ms(self, t_str): 
+        try:
+            parts = t_str.split('.')
+            ms = QTime.fromString(parts[0], "hh:mm:ss").msecsSinceStartOfDay()
+            if len(parts) > 1:
+                frac = parts[1].ljust(3, '0')[:3]
+                ms += int(frac)
+            return ms
+        except:
+            return 0
 
     def update_time_label(self, pos, dur):
         self.lbl_time.setText(f"{self.format_time(pos)} / {self.format_time(dur)}")
@@ -937,17 +977,58 @@ class EditorTab(QWidget):
             self.list_sections.setItemWidget(item, widget)
         self.slider.set_sections(sections_data)
 
-    def _run_ffmpeg_with_progress(self, cmd, signals, prefix=""):
+    def _run_ffmpeg_with_progress(self, cmd, signals, prefix="", current_offset_ms=0, total_ms=0):
         process = subprocess.Popen(cmd, shell=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True, encoding='utf-8', errors='replace', creationflags=0x08000000)
+        
+        with self.proc_lock:
+            self.active_processes.append(process)
+            
         for line in iter(process.stderr.readline, ''):
-            if not line: break
-            m = re.search(r'time=(\d{2}:\d{2}:\d{2})', line)
+            if self.cancel_requested:
+                break
+            m = re.search(r'time=(\d{2,3}):(\d{2}):(\d{2}\.\d+)', line)
             if m:
-                signals.progress.emit(f"{prefix}{m.group(1)}")
+                h, m_s, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+                ms = int((h * 3600 + m_s * 60 + s) * 1000)
+                
+                pct = 0
+                if total_ms > 0:
+                    pct = int(((current_offset_ms + ms) / total_ms) * 100)
+                    pct = min(100, max(0, pct))
+                
+                time_str = f"{h:02d}:{m_s:02d}:{int(s):02d}"
+                signals.progress.emit(pct, f"{prefix}{time_str}")
+                
         process.stderr.close()
         process.wait()
+        
+        with self.proc_lock:
+            if process in self.active_processes:
+                self.active_processes.remove(process)
+                
+        if self.cancel_requested:
+            raise Exception("작업이 취소되었습니다.")
         if process.returncode != 0:
             raise Exception("FFmpeg 처리 중 오류 발생")
+
+    def toggle_export(self):
+        if self.is_exporting:
+            self.cancel_export()
+        else:
+            self.execute_export()
+
+    def cancel_export(self):
+        self.cancel_requested = True
+        self.btn_export.setEnabled(False)
+        self.btn_export.setText("취소 처리 중...")
+        self.btn_export.setStyleSheet("")
+        
+        with self.proc_lock:
+            for p in self.active_processes:
+                try:
+                    subprocess.run(f'taskkill /F /T /PID {p.pid}', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0x08000000)
+                except Exception:
+                    pass
 
     def execute_export(self):
         if not self.current_file:
@@ -956,8 +1037,12 @@ class EditorTab(QWidget):
         if not self.sections_list:
             if QMessageBox.question(self, "확인", "전체를 변환할까요?") == QMessageBox.StandardButton.No: return
 
-        self.btn_export.setEnabled(False)
-        self.btn_export.setText("작업 시작 준비 중...")
+        self.is_exporting = True
+        self.cancel_requested = False
+        self.btn_export.setText("작업 시작 준비 중... ❌ 클릭 시 취소")
+        self.btn_export.setStyleSheet("background-color: #8b0000; color: white; font-weight: bold;")
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
         
         is_audio = self.chk_ext_audio.isChecked()
         audio_ext = self.cb_ext_audio.currentText()
@@ -969,17 +1054,27 @@ class EditorTab(QWidget):
         sections_to_process = [(self.format_time(s), self.format_time(e)) for s, e in self.sections_list]
         
         self.export_signals = ExportSignals()
-        self.export_signals.progress.connect(lambda t: self.btn_export.setText(f"작업 진행 중... (완료시간: {t})"))
+        self.export_signals.progress.connect(self.on_export_progress)
         self.export_signals.finished.connect(self.on_export_finished)
         
         threading.Thread(target=self._export_task, args=(self.current_file, sections_to_process, is_audio, audio_ext, is_merge, is_precision, out_dir, custom_name, self.export_signals), daemon=True).start()
 
+    def on_export_progress(self, pct, text):
+        if self.cancel_requested: return
+        self.btn_export.setText(f"내보내기 진행 중... ({pct}%) - {text} ❌ 클릭 시 취소")
+        if pct >= 0:
+            self.progress_bar.setValue(pct)
+
     def on_export_finished(self, success, msg):
+        self.is_exporting = False
+        self.cancel_requested = False
+        self.progress_bar.setVisible(False)
         self.btn_export.setEnabled(True)
         self.btn_export.setText("내보내기 실행")
+        self.btn_export.setStyleSheet("")
         if success:
             if hasattr(self.main_window, "metaObject"):
-                self.main_window.statusBar().showMessage("미디어 내보내기가 완료되었습니다!", 5000)
+                self.main_window.statusBar().showMessage("미디어 내보내기가 완료되었거나 취소되었습니다.", 5000)
         else:
             if hasattr(self.main_window, "metaObject"):
                 self.main_window.statusBar().showMessage(f"내보내기 오류: {msg[:50]}", 5000)
@@ -993,6 +1088,10 @@ class EditorTab(QWidget):
 
         try:
             if not sections: sections = [("00:00:00.000", self.format_time(self.player.duration()))]
+            
+            total_ms = sum(self.time_to_ms(e) - self.time_to_ms(s) for s, e in sections)
+            processed_ms = 0
+            
             for idx, (start, end) in enumerate(sections):
                 out_path = os.path.join(out_dir, f"{base_name}{ext}") if (len(sections)==1 and not is_merge) else os.path.join(out_dir, f"{base_name}_cut_{idx:03}{ext}")
                 cmd = f'"{ffmpeg}" -y -ss {start} -to {end} -i "{input_file}" '
@@ -1001,8 +1100,9 @@ class EditorTab(QWidget):
                 cmd += f'"{out_path}"'
                 
                 prefix = f"[{idx+1}/{len(sections)} 구간] " if len(sections) > 1 else ""
-                self._run_ffmpeg_with_progress(cmd, signals, prefix)
+                self._run_ffmpeg_with_progress(cmd, signals, prefix, processed_ms, total_ms)
                 created_files.append(out_path)
+                processed_ms += (self.time_to_ms(end) - self.time_to_ms(start))
 
             if is_merge and len(created_files) > 1:
                 merge_list = os.path.join(out_dir, "merge_list.txt")
@@ -1011,8 +1111,8 @@ class EditorTab(QWidget):
                 merged_out = os.path.join(out_dir, f"{base_name}{ext}")
                 cmd = f'"{ffmpeg}" -y -f concat -safe 0 -i "{merge_list}" -c copy "{merged_out}"'
                 
-                signals.progress.emit("최종 구간 병합 중...")
-                self._run_ffmpeg_with_progress(cmd, signals, "")
+                signals.progress.emit(99, "최종 구간 병합 중...")
+                self._run_ffmpeg_with_progress(cmd, signals, "", 0, 0)
                 os.remove(merge_list)
                 for cf in created_files: os.remove(cf)
                     
@@ -1079,6 +1179,11 @@ class MergerTab(QWidget):
         self.videos = [] 
         self.needs_reencoding = False
         
+        self.is_merging = False
+        self.cancel_requested = False
+        self.active_processes = []
+        self.proc_lock = threading.Lock()
+        
         self.setAcceptDrops(True)
         self.init_ui()
 
@@ -1138,12 +1243,22 @@ class MergerTab(QWidget):
         export_setting_layout.addWidget(QLabel("파일명:"))
         export_setting_layout.addWidget(self.entry_out_name, stretch=2)
         
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar { border: 1px solid #555; border-radius: 5px; text-align: center; height: 20px; }
+            QProgressBar::chunk { background-color: #00aa00; width: 10px; }
+        """)
+
         self.btn_export = QPushButton("병합 실행")
         self.btn_export.setMinimumHeight(40)
-        self.btn_export.clicked.connect(self.execute_export)
+        self.btn_export.clicked.connect(self.toggle_export)
         
         bottom_layout = QVBoxLayout()
         bottom_layout.addLayout(export_setting_layout)
+        bottom_layout.addWidget(self.progress_bar)
         bottom_layout.addWidget(self.btn_export)
         layout.addLayout(bottom_layout)
 
@@ -1270,17 +1385,58 @@ class MergerTab(QWidget):
             self.entry_out_dir.setText("")
             self.entry_out_name.setText("")
 
-    def _run_ffmpeg_with_progress(self, cmd, signals, prefix=""):
+    def _run_ffmpeg_with_progress(self, cmd, signals, prefix="", current_offset_ms=0, total_ms=0):
         process = subprocess.Popen(cmd, shell=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True, encoding='utf-8', errors='replace', creationflags=0x08000000)
+        
+        with self.proc_lock:
+            self.active_processes.append(process)
+            
         for line in iter(process.stderr.readline, ''):
-            if not line: break
-            m = re.search(r'time=(\d{2}:\d{2}:\d{2})', line)
+            if self.cancel_requested:
+                break
+            m = re.search(r'time=(\d{2,3}):(\d{2}):(\d{2}\.\d+)', line)
             if m:
-                signals.progress.emit(f"{prefix}{m.group(1)}")
+                h, m_s, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+                ms = int((h * 3600 + m_s * 60 + s) * 1000)
+                
+                pct = 0
+                if total_ms > 0:
+                    pct = int(((current_offset_ms + ms) / total_ms) * 100)
+                    pct = min(100, max(0, pct))
+                
+                time_str = f"{h:02d}:{m_s:02d}:{int(s):02d}"
+                signals.progress.emit(pct, f"{prefix}{time_str}")
+                
         process.stderr.close()
         process.wait()
+        
+        with self.proc_lock:
+            if process in self.active_processes:
+                self.active_processes.remove(process)
+                
+        if self.cancel_requested:
+            raise Exception("작업이 취소되었습니다.")
         if process.returncode != 0:
             raise Exception("FFmpeg 처리 중 오류 발생")
+
+    def toggle_export(self):
+        if self.is_merging:
+            self.cancel_export()
+        else:
+            self.execute_export()
+
+    def cancel_export(self):
+        self.cancel_requested = True
+        self.btn_export.setEnabled(False)
+        self.btn_export.setText("취소 처리 중...")
+        self.btn_export.setStyleSheet("")
+        
+        with self.proc_lock:
+            for p in self.active_processes:
+                try:
+                    subprocess.run(f'taskkill /F /T /PID {p.pid}', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0x08000000)
+                except Exception:
+                    pass
 
     def execute_export(self):
         if len(self.videos) < 2:
@@ -1300,24 +1456,38 @@ class MergerTab(QWidget):
             
         out_path = os.path.join(out_dir, f"{base_name}{ext}")
 
-        self.btn_export.setEnabled(False)
-        self.btn_export.setText("병합 시작 준비 중...")
+        self.is_merging = True
+        self.cancel_requested = False
+        self.btn_export.setText("병합 시작 준비 중... ❌ 클릭 시 취소")
+        self.btn_export.setStyleSheet("background-color: #8b0000; color: white; font-weight: bold;")
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
         
         target_res = self.cb_resolution.currentText()
         target_fps = self.cb_fps.currentText()
         
         self.merge_signals = ExportSignals()
-        self.merge_signals.progress.connect(lambda t: self.btn_export.setText(f"병합 진행 중... (완료시간: {t})"))
+        self.merge_signals.progress.connect(self.on_merge_progress)
         self.merge_signals.finished.connect(self.on_merge_finished)
         
         threading.Thread(target=self._merge_task, args=(out_path, target_res, target_fps, self.merge_signals), daemon=True).start()
 
+    def on_merge_progress(self, pct, text):
+        if self.cancel_requested: return
+        self.btn_export.setText(f"병합 진행 중... ({pct}%) - {text} ❌ 클릭 시 취소")
+        if pct >= 0:
+            self.progress_bar.setValue(pct)
+
     def on_merge_finished(self, success, msg):
+        self.is_merging = False
+        self.cancel_requested = False
+        self.progress_bar.setVisible(False)
         self.btn_export.setEnabled(True)
         self.btn_export.setText("병합 실행")
+        self.btn_export.setStyleSheet("")
         if success:
             if hasattr(self.main_window, "metaObject"):
-                self.main_window.statusBar().showMessage("비디오 병합이 완료되었습니다!", 5000)
+                self.main_window.statusBar().showMessage("비디오 병합이 완료되었거나 취소되었습니다.", 5000)
         else:
             if hasattr(self.main_window, "metaObject"):
                 self.main_window.statusBar().showMessage(f"병합 오류: {msg[:50]}", 5000)
@@ -1329,13 +1499,16 @@ class MergerTab(QWidget):
         temp_files = []
 
         try:
+            total_dur = sum(v['duration'] for v in self.videos)
+            processed_ms = 0
+
             if not self.needs_reencoding:
-                signals.progress.emit("무손실 초고속 병합 중...")
+                signals.progress.emit(0, "무손실 초고속 병합 중...")
                 merge_list = os.path.join(out_dir, "temp_merge_list.txt")
                 with open(merge_list, "w", encoding="utf-8") as f:
                     for v in self.videos: f.write(f"file '{v['path']}'\n")
                 cmd = f'"{ffmpeg}" -y -f concat -safe 0 -i "{merge_list}" -c copy "{out_path}"'
-                self._run_ffmpeg_with_progress(cmd, signals, "")
+                self._run_ffmpeg_with_progress(cmd, signals, "", 0, total_dur)
                 os.remove(merge_list)
             else:
                 w_list = [v['width'] for v in self.videos]
@@ -1359,14 +1532,15 @@ class MergerTab(QWidget):
                     cmd = f'"{ffmpeg}" -y -i "{v["path"]}" -vf "{vf}" -r {FPS} -c:v libx264 -preset fast -crf 18 -c:a copy "{temp_out}"'
                     
                     prefix = f"[{idx+1}/{len(self.videos)} 파일] "
-                    self._run_ffmpeg_with_progress(cmd, signals, prefix)
+                    self._run_ffmpeg_with_progress(cmd, signals, prefix, processed_ms, total_dur)
+                    processed_ms += v['duration']
                 
-                signals.progress.emit("최종 파일 병합 중...")
+                signals.progress.emit(99, "최종 파일 병합 중...")
                 merge_list = os.path.join(out_dir, "temp_merge_list.txt")
                 with open(merge_list, "w", encoding="utf-8") as f:
                     for tf in temp_files: f.write(f"file '{tf}'\n")
                 cmd = f'"{ffmpeg}" -y -f concat -safe 0 -i "{merge_list}" -c copy "{out_path}"'
-                self._run_ffmpeg_with_progress(cmd, signals, "")
+                self._run_ffmpeg_with_progress(cmd, signals, "", 0, 0)
                 
                 os.remove(merge_list)
                 for tf in temp_files: os.remove(tf)
@@ -1377,7 +1551,7 @@ class MergerTab(QWidget):
 
 
 # ==========================================
-# 6. 탭 4: 음원 태그 편집기 (신규)
+# 6. 탭 4: 음원 태그 편집기
 # ==========================================
 class AlbumArtLabel(QLabel):
     file_dropped = pyqtSignal(str)
@@ -1799,7 +1973,7 @@ class TagEditorTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("yt-dlp 미디어 통합 매니저 v1.1.0")
+        self.setWindowTitle("yt-dlp 미디어 통합 매니저 v1.2.0")
         self.resize(1000, 800)
         
         screen_geo = QApplication.primaryScreen().availableGeometry()
@@ -1822,23 +1996,29 @@ class MainWindow(QMainWindow):
         
         self.statusBar().showMessage("준비 완료")
 
-    # [추가됨] 프로그램 종료 시 안전 검사 로직
     def closeEvent(self, event):
-        if self.downloader_tab.is_downloading:
+        active_tasks = []
+        if self.downloader_tab.is_downloading: active_tasks.append("다운로드")
+        if self.editor_tab.is_exporting: active_tasks.append("미디어 편집")
+        if self.merger_tab.is_merging: active_tasks.append("비디오 병합")
+        
+        if active_tasks:
+            task_names = ", ".join(active_tasks)
             reply = QMessageBox.question(
                 self, '프로그램 종료 경고',
-                '현재 백그라운드에서 다운로드가 진행 중입니다.\n\n다운로드를 강제로 중단하고 프로그램을 종료하시겠습니까?',
+                f'현재 백그라운드에서 [{task_names}] 작업이 진행 중입니다.\n\n작업을 강제로 중단하고 프로그램을 종료하시겠습니까?',
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No
             )
             if reply == QMessageBox.StandardButton.Yes:
-                self.downloader_tab.cancel_download()
+                if self.downloader_tab.is_downloading: self.downloader_tab.cancel_download()
+                if self.editor_tab.is_exporting: self.editor_tab.cancel_export()
+                if self.merger_tab.is_merging: self.merger_tab.cancel_export()
                 event.accept()
             else:
                 event.ignore()
         else:
             event.accept()
-
 
 def resource_path(relative_path):
     try: base_path = sys._MEIPASS
