@@ -69,6 +69,12 @@ class ExportSignals(QObject):
     progress = pyqtSignal(int, str)
     finished = pyqtSignal(bool, str)
 
+class ExtractorSignals(QObject):
+    item_status = pyqtSignal(int, str)
+    progress = pyqtSignal(int, float)
+    total_start = pyqtSignal(int)
+    finished = pyqtSignal(bool, str)
+
 # ==========================================
 # 공통 UI 컴포넌트
 # ==========================================
@@ -185,16 +191,8 @@ class DownloaderTab(QWidget):
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
         self.progress_bar.setStyleSheet("""
-            QProgressBar {
-                border: 1px solid #555;
-                border-radius: 5px;
-                text-align: center;
-                height: 20px;
-            }
-            QProgressBar::chunk {
-                background-color: #00aa00;
-                width: 10px;
-            }
+            QProgressBar { border: 1px solid #555; border-radius: 5px; text-align: center; height: 20px; }
+            QProgressBar::chunk { background-color: #00aa00; width: 10px; }
         """)
         layout.addWidget(self.progress_bar)
 
@@ -1051,6 +1049,19 @@ class EditorTab(QWidget):
         out_dir = self.entry_out_dir.text().strip()
         custom_name = self.entry_out_name.text().strip()
         
+        # [버그 수정됨] 추천 포맷일 경우 원본 코덱 분석 후 적절한 확장자 할당
+        if is_audio and audio_ext == "추천":
+            ffprobe = self.main_window.downloader_tab.get_exe("ffprobe.exe").strip('"')
+            cmd_probe = f'"{ffprobe}" -v error -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "{self.current_file}"'
+            try:
+                proc = subprocess.run(cmd_probe, shell=True, capture_output=True, text=True, creationflags=0x08000000)
+                orig_codec = proc.stdout.strip().lower()
+                if orig_codec == 'opus': audio_ext = 'opus'
+                elif orig_codec == 'mp3': audio_ext = 'mp3'
+                else: audio_ext = 'm4a'
+            except:
+                audio_ext = 'm4a'
+        
         sections_to_process = [(self.format_time(s), self.format_time(e)) for s, e in self.sections_list]
         
         self.export_signals = ExportSignals()
@@ -1551,7 +1562,266 @@ class MergerTab(QWidget):
 
 
 # ==========================================
-# 6. 탭 4: 음원 태그 편집기
+# 6. 탭 4: 음원 일괄 추출기 (신규)
+# ==========================================
+class ExtractorTab(QWidget):
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+        self.is_extracting = False
+        self.cancel_requested = False
+        self.active_processes = []
+        self.proc_lock = threading.Lock()
+        
+        self.total_tasks = 0
+        self.task_progress = {}
+        
+        self.setAcceptDrops(True)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout()
+
+        top_layout = QHBoxLayout()
+        self.lbl_status = QLabel("음원으로 추출할 영상들을 차례대로 추가하세요.")
+        btn_add = QPushButton("영상 추가...")
+        btn_add.clicked.connect(self.add_files_dialog)
+        top_layout.addWidget(self.lbl_status, stretch=1)
+        top_layout.addWidget(btn_add)
+        layout.addLayout(top_layout)
+
+        self.lbl_drop = QLabel("📂 이 곳에 영상 파일들을 드래그 앤 드롭하세요")
+        self.lbl_drop.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_drop.setStyleSheet("background-color: #1e1e1e; color: #aaaaaa; font-size: 18px; border: 2px dashed #555555; padding: 30px;")
+        layout.addWidget(self.lbl_drop)
+
+        self.list_widget = QListWidget()
+        layout.addWidget(self.list_widget, stretch=1)
+
+        btn_del = QPushButton("선택 항목 삭제")
+        btn_del.clicked.connect(self.remove_selected)
+        layout.addWidget(btn_del)
+
+        export_setting_layout = QHBoxLayout()
+        self.entry_out_dir = QLineEdit()
+        self.entry_out_dir.setText(Config.DEFAULT_PATHS["음원 저장 폴더"])
+        self.btn_out_dir = QPushButton("저장 폴더 변경")
+        self.btn_out_dir.clicked.connect(self.change_out_dir)
+
+        self.cb_ext_audio = QComboBox()
+        self.cb_ext_audio.addItems(["추천", "mp3", "m4a", "aac", "opus"])
+
+        export_setting_layout.addWidget(QLabel("저장 위치:"))
+        export_setting_layout.addWidget(self.entry_out_dir, stretch=2)
+        export_setting_layout.addWidget(self.btn_out_dir)
+        export_setting_layout.addSpacing(10)
+        export_setting_layout.addWidget(QLabel("저장 형식:"))
+        export_setting_layout.addWidget(self.cb_ext_audio)
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar { border: 1px solid #555; border-radius: 5px; text-align: center; height: 20px; }
+            QProgressBar::chunk { background-color: #00aa00; width: 10px; }
+        """)
+
+        self.btn_export = QPushButton("음원 일괄 추출 실행")
+        self.btn_export.setMinimumHeight(40)
+        self.btn_export.clicked.connect(self.toggle_export)
+        
+        bottom_layout = QVBoxLayout()
+        bottom_layout.addLayout(export_setting_layout)
+        bottom_layout.addWidget(self.progress_bar)
+        bottom_layout.addWidget(self.btn_export)
+        layout.addLayout(bottom_layout)
+
+        self.setLayout(layout)
+
+    def change_out_dir(self):
+        default_dir = self.entry_out_dir.text() or Config.DEFAULT_PATHS["음원 저장 폴더"]
+        path = QFileDialog.getExistingDirectory(self, "저장 폴더 선택", default_dir)
+        if path:
+            self.entry_out_dir.setText(os.path.normpath(path))
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls(): event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent):
+        urls = event.mimeData().urls()
+        if urls: 
+            paths = [u.toLocalFile() for u in urls if u.toLocalFile()]
+            if paths:
+                event.acceptProposedAction()
+                QTimer.singleShot(10, lambda p=paths: self.process_dropped_files(p))
+
+    def add_files_dialog(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "추출할 영상 선택", Config.DEFAULT_PATHS["영상 저장 폴더"])
+        if paths: self.process_dropped_files(paths)
+
+    def process_dropped_files(self, paths):
+        for path in paths:
+            item = QListWidgetItem(f"[대기 중] {os.path.basename(path)}")
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            self.list_widget.addItem(item)
+        self.lbl_status.setText(f"총 {self.list_widget.count()}개의 영상 대기 중")
+
+    def remove_selected(self):
+        for item in self.list_widget.selectedItems():
+            self.list_widget.takeItem(self.list_widget.row(item))
+        self.lbl_status.setText(f"총 {self.list_widget.count()}개의 영상 대기 중")
+
+    def toggle_export(self):
+        if self.is_extracting:
+            self.cancel_export()
+        else:
+            self.execute_export()
+
+    def cancel_export(self):
+        self.cancel_requested = True
+        self.btn_export.setEnabled(False)
+        self.btn_export.setText("취소 처리 중...")
+        self.btn_export.setStyleSheet("")
+        
+        with self.proc_lock:
+            for p in self.active_processes:
+                try:
+                    subprocess.run(f'taskkill /F /T /PID {p.pid}', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0x08000000)
+                except Exception:
+                    pass
+
+    def execute_export(self):
+        files = [self.list_widget.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.list_widget.count())]
+        if not files:
+            QMessageBox.warning(self, "경고", "추출할 영상이 없습니다.")
+            return
+
+        self.is_extracting = True
+        self.cancel_requested = False
+        self.btn_export.setText("음원 일괄 추출 준비 중... ❌ 클릭 시 취소")
+        self.btn_export.setStyleSheet("background-color: #8b0000; color: white; font-weight: bold;")
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        
+        out_dir = self.entry_out_dir.text().strip()
+        aud_ext = self.cb_ext_audio.currentText()
+        
+        self.ext_signals = ExtractorSignals()
+        self.ext_signals.item_status.connect(self.on_item_status)
+        self.ext_signals.progress.connect(self.on_progress)
+        self.ext_signals.total_start.connect(self.on_total_start)
+        self.ext_signals.finished.connect(self.on_finished)
+        
+        threading.Thread(target=self.extractor_manager, args=(files, out_dir, aud_ext, self.ext_signals), daemon=True).start()
+
+    def on_total_start(self, total):
+        self.total_tasks = total
+        self.task_progress = {i: 0.0 for i in range(total)}
+        
+    def on_item_status(self, idx, status):
+        item = self.list_widget.item(idx)
+        if item:
+            path = item.data(Qt.ItemDataRole.UserRole)
+            item.setText(f"[{status}] {os.path.basename(path)}")
+
+    def on_progress(self, task_idx, pct):
+        if self.cancel_requested: return
+        self.task_progress[task_idx] = pct
+        if self.total_tasks > 0:
+            avg = sum(self.task_progress.values()) / self.total_tasks
+            self.progress_bar.setValue(int(avg))
+            self.btn_export.setText(f"음원 일괄 추출 진행 중... ({int(avg)}%) ❌ 클릭 시 취소")
+
+    def on_finished(self, success, msg):
+        self.is_extracting = False
+        self.cancel_requested = False
+        self.progress_bar.setVisible(False)
+        self.btn_export.setEnabled(True)
+        self.btn_export.setText("음원 일괄 추출 실행")
+        self.btn_export.setStyleSheet("")
+        if success:
+            if hasattr(self.main_window, "metaObject"):
+                self.main_window.statusBar().showMessage("음원 추출 작업이 완료되었거나 취소되었습니다.", 5000)
+
+    def extractor_manager(self, files, out_dir, aud_ext, signals):
+        signals.total_start.emit(len(files))
+        os.makedirs(out_dir, exist_ok=True)
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(self.extract_single, path, i, out_dir, aud_ext, signals) for i, path in enumerate(files)]
+            concurrent.futures.wait(futures)
+            
+        signals.finished.emit(not self.cancel_requested, "작업 종료")
+
+    def extract_single(self, path, task_idx, out_dir, aud_ext, signals):
+        if self.cancel_requested: return
+        signals.item_status.emit(task_idx, "추출 중...")
+        
+        ffmpeg = self.main_window.downloader_tab.get_exe("ffmpeg.exe").strip('"')
+        ffprobe = self.main_window.downloader_tab.get_exe("ffprobe.exe").strip('"')
+        
+        try:
+            cmd_probe_dur = f'"{ffprobe}" -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{path}"'
+            proc_dur = subprocess.run(cmd_probe_dur, shell=True, capture_output=True, text=True, creationflags=0x08000000)
+            try: dur_sec = float(proc_dur.stdout.strip())
+            except: dur_sec = 0
+            
+            cmd_probe_codec = f'"{ffprobe}" -v error -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "{path}"'
+            proc_codec = subprocess.run(cmd_probe_codec, shell=True, capture_output=True, text=True, creationflags=0x08000000)
+            orig_codec = proc_codec.stdout.strip().lower()
+            
+            out_ext = aud_ext
+            if aud_ext == "추천":
+                if orig_codec == "opus": out_ext = "opus"
+                elif orig_codec == "mp3": out_ext = "mp3"
+                else: out_ext = "m4a"
+                
+            name = os.path.splitext(os.path.basename(path))[0]
+            out_path = os.path.join(out_dir, f"{name}.{out_ext}")
+            
+            is_compat = (aud_ext == "추천") or (out_ext == "opus" and orig_codec == "opus") or (out_ext == "mp3" and orig_codec == "mp3") or (out_ext == "m4a" and orig_codec == "aac")
+            
+            if is_compat: cmd = f'"{ffmpeg}" -y -i "{path}" -vn -c:a copy "{out_path}"'
+            else: cmd = f'"{ffmpeg}" -y -i "{path}" -vn -b:a 192k "{out_path}"'
+            
+            process = subprocess.Popen(cmd, shell=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True, encoding='utf-8', errors='replace', creationflags=0x08000000)
+            
+            with self.proc_lock:
+                self.active_processes.append(process)
+                
+            for line in iter(process.stderr.readline, ''):
+                if self.cancel_requested: break
+                m = re.search(r'time=(\d{2,3}):(\d{2}):(\d{2}\.\d+)', line)
+                if m and dur_sec > 0:
+                    h, m_s, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+                    cur_sec = h * 3600 + m_s * 60 + s
+                    pct = (cur_sec / dur_sec) * 100
+                    signals.progress.emit(task_idx, min(100.0, pct))
+                    
+            process.stderr.close()
+            process.wait()
+            
+            with self.proc_lock:
+                if process in self.active_processes:
+                    self.active_processes.remove(process)
+                    
+            if self.cancel_requested:
+                signals.item_status.emit(task_idx, "취소됨")
+                return
+                
+            if process.returncode == 0:
+                signals.progress.emit(task_idx, 100.0)
+                signals.item_status.emit(task_idx, "완료")
+            else:
+                signals.item_status.emit(task_idx, "오류")
+                
+        except Exception as e:
+            signals.item_status.emit(task_idx, "오류")
+
+
+# ==========================================
+# 7. 탭 5: 음원 태그 편집기
 # ==========================================
 class AlbumArtLabel(QLabel):
     file_dropped = pyqtSignal(str)
@@ -1968,12 +2238,12 @@ class TagEditorTab(QWidget):
             return False
 
 # ==========================================
-# 7. 메인 윈도우 (탭 관리자)
+# 8. 메인 윈도우 (탭 관리자)
 # ==========================================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("yt-dlp 미디어 통합 매니저 v1.2.0")
+        self.setWindowTitle("yt-dlp 미디어 통합 매니저 v1.3.0")
         self.resize(1000, 800)
         
         screen_geo = QApplication.primaryScreen().availableGeometry()
@@ -1987,11 +2257,13 @@ class MainWindow(QMainWindow):
         self.downloader_tab = DownloaderTab()
         self.editor_tab = EditorTab(self)
         self.merger_tab = MergerTab(self)
+        self.extractor_tab = ExtractorTab(self) 
         self.tag_tab = TagEditorTab(self)
 
         self.tabs.addTab(self.downloader_tab, "⬇️ 다운로더")
         self.tabs.addTab(self.editor_tab, "✂️ 미디어 편집기")
         self.tabs.addTab(self.merger_tab, "🔗 비디오 병합기")
+        self.tabs.addTab(self.extractor_tab, "🎙️ 음원 일괄 추출기") 
         self.tabs.addTab(self.tag_tab, "🎵 음원 태그 편집기")
         
         self.statusBar().showMessage("준비 완료")
@@ -2001,6 +2273,7 @@ class MainWindow(QMainWindow):
         if self.downloader_tab.is_downloading: active_tasks.append("다운로드")
         if self.editor_tab.is_exporting: active_tasks.append("미디어 편집")
         if self.merger_tab.is_merging: active_tasks.append("비디오 병합")
+        if self.extractor_tab.is_extracting: active_tasks.append("음원 추출")
         
         if active_tasks:
             task_names = ", ".join(active_tasks)
@@ -2014,6 +2287,7 @@ class MainWindow(QMainWindow):
                 if self.downloader_tab.is_downloading: self.downloader_tab.cancel_download()
                 if self.editor_tab.is_exporting: self.editor_tab.cancel_export()
                 if self.merger_tab.is_merging: self.merger_tab.cancel_export()
+                if self.extractor_tab.is_extracting: self.extractor_tab.cancel_export()
                 event.accept()
             else:
                 event.ignore()
