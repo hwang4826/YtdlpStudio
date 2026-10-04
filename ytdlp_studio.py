@@ -59,7 +59,7 @@ class Config:
 # ==========================================
 class WorkerSignals(QObject):
     log_msg = pyqtSignal(str)
-    finished = pyqtSignal(int, int, int) # [성공, 오류, 취소] 개수 전달
+    finished = pyqtSignal(int, int, int) 
     error = pyqtSignal(str)
     update_ui = pyqtSignal()
     dl_start = pyqtSignal(int)
@@ -73,7 +73,7 @@ class ExtractorSignals(QObject):
     item_status = pyqtSignal(int, str)
     progress = pyqtSignal(int, float)
     total_start = pyqtSignal(int)
-    finished = pyqtSignal(int, int, int) # [성공, 오류, 취소] 개수 전달
+    finished = pyqtSignal(int, int, int) 
 
 # ==========================================
 # 공통 UI 컴포넌트
@@ -327,6 +327,7 @@ class DownloaderTab(QWidget):
             self.active_processes.append(process)
             
         downloaded_file = None
+        tracked_files = set()
             
         for line in iter(process.stdout.readline, b''):
             if self.cancel_requested:
@@ -341,12 +342,22 @@ class DownloaderTab(QWidget):
                 if m:
                     self.signals.dl_progress.emit(task_id, float(m.group(1)))
 
-            m_dest = re.search(r'Destination:\s*(.+)$', decoded_line)
             m_merge = re.search(r'Merging formats into\s*"(.+)"', decoded_line)
+            m_dest = re.search(r'Destination:\s*(.+)$', decoded_line)
+            m_already = re.search(r'\[download\]\s+(.*?)\s+has already been downloaded', decoded_line)
+
             if m_merge:
-                downloaded_file = m_merge.group(1).strip()
-            elif m_dest and not downloaded_file:
-                downloaded_file = m_dest.group(1).strip()
+                df = m_merge.group(1).strip()
+                downloaded_file = df
+                tracked_files.add(df)
+            elif m_already:
+                df = m_already.group(1).strip()
+                if not downloaded_file: downloaded_file = df
+                tracked_files.add(df)
+            elif m_dest:
+                df = m_dest.group(1).strip()
+                if not downloaded_file: downloaded_file = df
+                tracked_files.add(df)
 
             self.signals.log_msg.emit(f"{prefix}{decoded_line}")
             
@@ -357,7 +368,7 @@ class DownloaderTab(QWidget):
             if process in self.active_processes:
                 self.active_processes.remove(process)
                 
-        return process.returncode, downloaded_file
+        return process.returncode, downloaded_file, tracked_files
 
     def install_tools(self):
         def _task():
@@ -440,6 +451,38 @@ class DownloaderTab(QWidget):
         except:
             return "aac"
 
+    # [수정됨] 스마트 텍스트 매칭 (이모티콘 대응) 로직
+    def find_actual_file(self, target_folder, mangled_path):
+        folder = os.path.dirname(mangled_path)
+        if not folder or not os.path.exists(folder):
+            folder = target_folder
+            
+        base_name = os.path.basename(mangled_path)
+        name_only, ext = os.path.splitext(base_name)
+        
+        # 알파벳, 숫자, 한글을 제외한 모든 특수문자, 이모티콘, 공백 제거
+        def clean_str(s):
+            return re.sub(r'[^\w가-힣]', '', s)
+            
+        clean_target = clean_str(name_only)
+        
+        candidates = []
+        for f in glob.glob(os.path.join(folder, f"*{ext}")):
+            f_name, _ = os.path.splitext(os.path.basename(f))
+            if clean_str(f_name) == clean_target:
+                candidates.append(f)
+                
+        if candidates:
+            return max(candidates, key=os.path.getctime)
+            
+        # 2차 방어선 (기존 로직)
+        safe_pattern = mangled_path.replace('?', '*').replace('', '*')
+        matches = glob.glob(safe_pattern)
+        if matches:
+            return max(matches, key=os.path.getctime)
+            
+        return None
+
     def download_task(self, url, task_id):
         if self.cancel_requested: 
             with self.stats_lock: self.task_stats['canceled'] += 1
@@ -486,11 +529,16 @@ class DownloaderTab(QWidget):
             
             self.signals.log_msg.emit(f"{prefix}📥 다운로드 시작...\n")
             
-            retcode, downloaded_file = self.run_cmd(cmd, prefix, task_id)
+            retcode, downloaded_file, tracked_files = self.run_cmd(cmd, prefix, task_id)
             
             if self.cancel_requested:
-                self.signals.log_msg.emit(f"{prefix}🛑 작업 취소됨\n")
+                self.signals.log_msg.emit(f"{prefix}🛑 작업 취소됨. 파편 파일을 정리합니다...\n")
                 with self.stats_lock: self.task_stats['canceled'] += 1
+                for f in tracked_files:
+                    for ext in ['', '.part', '.ytdl']:
+                        try:
+                            if os.path.exists(f + ext): os.remove(f + ext)
+                        except: pass
                 return
                 
             if retcode != 0:
@@ -499,10 +547,19 @@ class DownloaderTab(QWidget):
                 return
             
             if self.chk_audio.isChecked():
-                if downloaded_file and os.path.exists(downloaded_file):
-                    self.extract_audio_task_safe(downloaded_file, prefix)
+                if downloaded_file:
+                    if os.path.exists(downloaded_file):
+                        self.extract_audio_task_safe(downloaded_file, prefix)
+                    else:
+                        exact_file = self.find_actual_file(self.get_setting("영상 저장 폴더"), downloaded_file)
+                        if exact_file and os.path.exists(exact_file):
+                            self.extract_audio_task_safe(exact_file, prefix)
+                        else:
+                            self.signals.log_msg.emit(f"{prefix}⚠️ 정확한 파일명을 찾지 못해 추출에 실패했습니다. ({downloaded_file})\n")
+                            with self.stats_lock: self.task_stats['error'] += 1
+                            return
                 else:
-                    self.signals.log_msg.emit(f"{prefix}⚠️️ 정확한 파일명을 찾지 못해 추출에 실패했습니다.\n")
+                    self.signals.log_msg.emit(f"{prefix}⚠️ 정확한 파일명을 찾지 못해 추출에 실패했습니다.\n")
                     with self.stats_lock: self.task_stats['error'] += 1
                     return
 
@@ -539,7 +596,12 @@ class DownloaderTab(QWidget):
         
         self.run_cmd(ffmpeg_cmd, prefix)
         
-        if not self.chk_video.isChecked():
+        if self.cancel_requested:
+            if os.path.exists(output_file):
+                try: os.remove(output_file)
+                except: pass
+        
+        if not self.chk_video.isChecked() and not self.cancel_requested:
             try: os.remove(exact_file)
             except: pass
 
@@ -1158,10 +1220,10 @@ class EditorTab(QWidget):
         self.btn_export.setText("내보내기 실행")
         self.btn_export.setStyleSheet("")
         
-        if self.cancel_requested:
-            QMessageBox.information(self, "취소됨", "미디어 내보내기 작업이 취소되었습니다.")
-        elif success:
+        if success:
             QMessageBox.information(self, "완료", "미디어 내보내기가 성공적으로 완료되었습니다.")
+        elif msg == "작업이 취소되었습니다.":
+            QMessageBox.information(self, "취소됨", "미디어 내보내기 작업이 취소되었습니다.")
         else:
             QMessageBox.warning(self, "오류", f"내보내기 중 오류가 발생했습니다:\n{msg}")
 
@@ -1171,6 +1233,9 @@ class EditorTab(QWidget):
         base_name = custom_name if custom_name else f"{os.path.splitext(os.path.basename(input_file))[0]}_edited"
         ext = os.path.splitext(input_file)[1] if not is_audio else f".{audio_ext}"
         created_files = []
+        out_path = ""
+        merged_out = ""
+        merge_list = ""
 
         try:
             if not sections: sections = [("00:00:00.000", self.format_time(self.player.duration()))]
@@ -1204,6 +1269,20 @@ class EditorTab(QWidget):
                     
             signals.finished.emit(True, "완료")
         except Exception as e:
+            for cf in created_files:
+                if os.path.exists(cf):
+                    try: os.remove(cf)
+                    except: pass
+            if out_path and os.path.exists(out_path):
+                try: os.remove(out_path)
+                except: pass
+            if merged_out and os.path.exists(merged_out):
+                try: os.remove(merged_out)
+                except: pass
+            if merge_list and os.path.exists(merge_list):
+                try: os.remove(merge_list)
+                except: pass
+                
             signals.finished.emit(False, str(e))
 
 
@@ -1584,6 +1663,7 @@ class MergerTab(QWidget):
         out_dir = os.path.dirname(out_path)
         os.makedirs(out_dir, exist_ok=True)
         temp_files = []
+        merge_list = ""
 
         try:
             total_dur = sum(v['duration'] for v in self.videos)
@@ -1634,6 +1714,16 @@ class MergerTab(QWidget):
 
             signals.finished.emit(True, "완료")
         except Exception as e:
+            for tf in temp_files:
+                if os.path.exists(tf):
+                    try: os.remove(tf)
+                    except: pass
+            if out_path and os.path.exists(out_path):
+                try: os.remove(out_path)
+                except: pass
+            if merge_list and os.path.exists(merge_list):
+                try: os.remove(merge_list)
+                except: pass
             signals.finished.emit(False, str(e))
 
 
@@ -1841,15 +1931,16 @@ class ExtractorTab(QWidget):
         signals.finished.emit(self.task_stats['success'], self.task_stats['error'], self.task_stats['canceled'])
 
     def extract_single(self, path, task_idx, out_dir, aud_ext, signals):
+        ffmpeg = self.main_window.downloader_tab.get_exe("ffmpeg.exe").strip('"')
+        ffprobe = self.main_window.downloader_tab.get_exe("ffprobe.exe").strip('"')
+        out_path = ""
+        
         if self.cancel_requested:
             with self.stats_lock: self.task_stats['canceled'] += 1
             signals.item_status.emit(task_idx, "취소됨")
             return
             
         signals.item_status.emit(task_idx, "추출 중...")
-        
-        ffmpeg = self.main_window.downloader_tab.get_exe("ffmpeg.exe").strip('"')
-        ffprobe = self.main_window.downloader_tab.get_exe("ffprobe.exe").strip('"')
         
         try:
             cmd_probe_dur = f'"{ffprobe}" -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{path}"'
@@ -1899,6 +1990,9 @@ class ExtractorTab(QWidget):
             if self.cancel_requested:
                 with self.stats_lock: self.task_stats['canceled'] += 1
                 signals.item_status.emit(task_idx, "취소됨")
+                if os.path.exists(out_path):
+                    try: os.remove(out_path)
+                    except: pass
                 return
                 
             if process.returncode == 0:
@@ -1908,10 +2002,16 @@ class ExtractorTab(QWidget):
             else:
                 with self.stats_lock: self.task_stats['error'] += 1
                 signals.item_status.emit(task_idx, "오류")
+                if os.path.exists(out_path):
+                    try: os.remove(out_path)
+                    except: pass
                 
         except Exception as e:
             with self.stats_lock: self.task_stats['error'] += 1
             signals.item_status.emit(task_idx, "오류")
+            if out_path and os.path.exists(out_path):
+                try: os.remove(out_path)
+                except: pass
 
 
 # ==========================================
@@ -2337,7 +2437,7 @@ class TagEditorTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("yt-dlp 미디어 통합 매니저 v1.3.0")
+        self.setWindowTitle("yt-dlp 미디어 통합 매니저 v1.3.1")
         self.resize(1000, 800)
         
         screen_geo = QApplication.primaryScreen().availableGeometry()
